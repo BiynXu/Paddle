@@ -142,6 +142,7 @@ ir::Tensor Compute(const std::vector<Expr> &domain,
 
   // When the fn_body is a CallExtern, a tensor will return directly.
   if (fn_body.as_tensor()) {
+    LOG(INFO) << "222222222222";
     return fn_body.as_tensor_ref();
   }
 
@@ -181,6 +182,9 @@ ir::Tensor Compute(const std::vector<Expr> &domain,
 
   auto op = ir::ComputeOp::Make(
       unique_name, fn, real_shape, domain_without_reduce_axis, reduce_axis);
+  LOG(INFO) << "real_shape.size() = " << real_shape.size();
+  LOG(INFO) << "domain_without_reduce_axis.size()"
+            << domain_without_reduce_axis.size();
   auto tensor = ir::Tensor(unique_name,
                            fn_body.type(),
                            real_shape,

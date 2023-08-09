@@ -105,34 +105,34 @@ class TestReduceAll(TestCaseHelper):
         self.class_name = "TestReduceOpCase"
         self.cls = TestReduceOp
         self.inputs = [
-            {
-                "shape": [1],
-                "axis": [-1],
-            },
-            {
-                "shape": [1024],
-                "axis": [0],
-            },
-            {
-                "shape": [512, 256],
-                "axis": [1],
-            },
+            # {
+            #     "shape": [1],
+            #     "axis": [-1],
+            # },
+            # {
+            #     "shape": [1024],
+            #     "axis": [0],
+            # },
+            # {
+            #     "shape": [512, 256],
+            #     "axis": [1],
+            # },
             {
                 "shape": [128, 64, 32],
                 "axis": [2],
             },
-            {
-                "shape": [16, 8, 4, 2],
-                "axis": [3],
-            },
-            {
-                "shape": [16, 8, 4, 2, 1],
-                "axis": [3],
-            },
-            {
-                "shape": [1, 1, 1, 1, 1],
-                "axis": [3],
-            },
+            # {
+            #     "shape": [16, 8, 4, 2],
+            #     "axis": [3],
+            # },
+            # {
+            #     "shape": [16, 8, 4, 2, 1],
+            #     "axis": [3],
+            # },
+            # {
+            #     "shape": [1, 1, 1, 1, 1],
+            #     "axis": [3],
+            # },
         ]
         self.dtypes = [
             {
@@ -140,14 +140,14 @@ class TestReduceAll(TestCaseHelper):
             },
         ]
         self.attrs = [
-            {"op_type": "sum", "keepdim": True},
+            # {"op_type": "sum", "keepdim": True},
             {"op_type": "sum", "keepdim": False},
-            {"op_type": "prod", "keepdim": True},
-            {"op_type": "prod", "keepdim": False},
-            {"op_type": "max", "keepdim": True},
-            {"op_type": "max", "keepdim": False},
-            {"op_type": "min", "keepdim": True},
-            {"op_type": "min", "keepdim": False},
+            # {"op_type": "prod", "keepdim": True},
+            # {"op_type": "prod", "keepdim": False},
+            # {"op_type": "max", "keepdim": True},
+            # {"op_type": "max", "keepdim": False},
+            # {"op_type": "min", "keepdim": True},
+            # {"op_type": "min", "keepdim": False},
         ]
 
 

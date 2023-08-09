@@ -19,16 +19,21 @@
 #include <string>
 #include <unordered_set>
 
+#include "paddle/cinn/common/cas.h"
 #include "paddle/cinn/common/common.h"
 #include "paddle/cinn/common/context.h"
 #include "paddle/cinn/common/ir_util.h"
 #include "paddle/cinn/ir/ir_base.h"
 #include "paddle/cinn/ir/ir_printer.h"
 #include "paddle/cinn/ir/tensor.h"
+#include "paddle/cinn/optim/ir_copy.h"
+#include "paddle/cinn/optim/ir_simplify.h"
 #include "paddle/cinn/optim/remove_nested_block.h"
 #include "paddle/cinn/optim/replace_var_with_expr.h"
 #include "paddle/cinn/optim/transform_polyfor_to_for.h"
 #include "paddle/cinn/poly/stage.h"
+
+DECLARE_bool(cinn_new_group_scheduler);
 
 namespace cinn {
 namespace lang {
@@ -756,15 +761,21 @@ std::vector<Expr> LowerImpl::GenerateFunctionBody(
         std::vector<Expr> iter_values;
         std::vector<Var> axis_vars =
             common::GenDefaultAxis(tensor->shape.size());
+        for (int i = 0; i < tensor->shape.size(); ++i) {
+          axis_vars[i]->lower_bound = Expr(0);
+          axis_vars[i]->upper_bound = optim::IRCopy(tensor->shape[i]);
+        }
         // bind var_values
         axis_vars.insert(axis_vars.end(),
                          tensor->reduce_axis.begin(),
                          tensor->reduce_axis.end());
+        int index = 0;
         for (int i = 0; i < var_counts; i++) {
-          block_vars.push_back(Var(Expr(0),
-                                   Expr(int_shape[i]),
-                                   cinn::UniqName("i" + std::to_string(i)),
-                                   false));
+          block_vars.push_back(
+              Var(Expr(0),
+                  Expr(int_shape[i]),
+                  cinn::UniqName("i" + std::to_string(index++)),
+                  false));
           if (i >= tensor->shape.size()) {
             block_vars[i]->is_reduce_axis = true;
             axis_vars[i]->is_reduce_axis = true;
@@ -775,6 +786,75 @@ std::vector<Expr> LowerImpl::GenerateFunctionBody(
                   << " to block_var " << block_vars[i];
           optim::ReplaceVarWithExpr(&store_body, axis_vars[i], block_vars[i]);
         }
+
+        // auto ChangeVarsToLoopVar = [&](Expr expr) {
+        //   std::set<Expr> vars_in_expr = ir::CollectIRNodesWithoutTensor(expr,
+        //   [](const Expr* x) {
+        //     return x->As<ir::_Var_>();
+        //   });
+        //   for (const Expr& var : vars_in_expr) {
+        //     for (int i = 0; i < iter_values.size(); ++i) {
+        //       if (iter_values[i].As<ir::_Var_>() && var.As<ir::_Var_>()->name
+        //       == block_vars[i].As<ir::_Var_>()->name) {
+        //         CHECK(iter_values[i].As<ir::_Var_>()->upper_bound.defined());
+        //         optim::ReplaceVarWithExpr(&expr, var.as_var_ref(),
+        //         iter_values[i]); LOG(INFO) << "expr: " << expr;
+        //       }
+        //     }
+        //   }
+        // };
+
+        // auto CalculateExtent = [](Expr expr) {
+        //   struct Mutator : public ir::IRMutator<ir::Expr*> {
+        //     void operator()(Expr* expr) { Visit(expr); }
+        //     void Visit(Expr* expr) { ir::IRMutator<>::Visit(expr, expr); }
+
+        //    private:
+        //     void Visit(const ir::_Var_* op, Expr* expr) override {
+        //       *expr = op->upper_bound;
+        //     }
+        //   };
+        //   Expr expr_copy = optim::IRCopy(expr);
+        //   Mutator mutator;
+        //   mutator(&expr_copy);
+        //   expr_copy = common::AutoSimplify(expr_copy);
+        //   LOG(INFO) << "expr_copy: " << expr_copy;
+        //   CHECK(expr_copy.is_constant());
+        //   return static_cast<int>(expr_copy.get_constant());
+        // };
+
+        // if(FLAGS_cinn_new_group_scheduler) {
+        //   std::set<Expr> store_and_load =
+        //   ir::CollectIRNodesWithoutTensor(store_body, [](const Expr* expr) {
+        //     return expr->As<ir::Store>() || expr->As<ir::Load>();
+        //   });
+        //   for (Expr node : store_and_load) {
+        //     std::vector<Expr> indices;
+        //     if (node.As<ir::Store>()) {
+        //       indices = node.As<ir::Store>()->indices;
+        //     } else if (node.As<ir::Load>()) {
+        //       indices = node.As<ir::Load>()->indices;
+        //     }
+        //     for (int i = 0; i < indices.size(); i++) {
+        //       if (indices[i].As<ir::_Var_>()) {
+        //         continue;
+        //       }
+        //       ir::Var new_var(Expr(0),
+        //             Expr(CalculateExtent(indices[i])),
+        //             cinn::UniqName("i" + std::to_string(index++)),
+        //             false);
+        //       ChangeVarsToLoopVar(indices[i]);
+        //       iter_values.push_back(indices[i]);
+        //       block_vars.push_back(new_var);
+        //       if (node.As<ir::Store>()) {
+        //         node.As<ir::Store>()->indices[i] = Expr(new_var);
+        //       } else if (node.As<ir::Load>()) {
+        //         node.As<ir::Load>()->indices[i] = Expr(new_var);
+        //       }
+        //     }
+        //   }
+        // }
+
         store_body = ir::ScheduleBlockRealize::Make(
             iter_values,
             ir::ScheduleBlock::Make(

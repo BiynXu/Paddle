@@ -48,6 +48,13 @@ bool AutoInline::CanInlineIntoConsumer(const Expr& sche_block_realize_expr,
   ir::Expr compute_body = sche_block->body;
   ir::Expr root = ir_sch->GetRootBlock(sche_block_realize_expr);
 
+  for (const ir::Var& iter_var : sche_block->iter_vars) {
+    LOG(INFO) << iter_var << ": is_reduce_axis: " << iter_var->is_reduce_axis;
+    if (iter_var->is_reduce_axis) {
+      return false;
+    }
+  }
+
   // Check the schedule block to be inlined is not a reduce tensor.
   std::set<ir::Expr> find_store = ir::CollectIRNodesWithoutTensor(
       compute_body, [&](const Expr* x) { return x->As<ir::Store>(); });
@@ -66,6 +73,13 @@ bool AutoInline::CanInlineIntoConsumer(const Expr& sche_block_realize_expr,
           no_inline_output_names_.end() ||
       no_inline_output_names_.find(tensor->buffer->name) !=
           no_inline_output_names_.end()) {
+    return false;
+  }
+
+  // A temporary solution for the ScheduleBlock used to initialize tensor value,
+  // such as xxx_reduce_init.
+  if (tensor->name.length() > 5 &&
+      tensor->name.substr(tensor->name.length() - 5, 5) == "_init") {
     return false;
   }
 
@@ -119,6 +133,9 @@ AutoInlineType AutoInline::AnalyzeInlineType(
   const ir::ScheduleBlock* sche_block =
       sche_block_realize->schedule_block.As<ir::ScheduleBlock>();
 
+  LOG(INFO) << "sche_block_realize_expr: " << sche_block_realize_expr;
+  LOG(INFO) << "sche_block->write_buffers.size() = "
+            << sche_block->write_buffers.size();
   // Inline if the block has only 1 write buffer
   if (sche_block->write_buffers.size() != 1) {
     return AutoInlineType::kCannotInline;

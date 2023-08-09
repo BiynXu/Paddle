@@ -181,6 +181,7 @@ Tensor DoReduce(const Tensor& tensor,
     return fn(tensor(eval_indice), reduce_axes, initial);
   };
 
+  LOG(INFO) << "output_shape.size() = " << output_shape.size();
   Tensor C = Compute(output_shape, compute, output_name);
   return C;
 }

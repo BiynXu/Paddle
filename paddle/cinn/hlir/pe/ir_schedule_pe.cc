@@ -31,13 +31,118 @@
 #include "paddle/cinn/hlir/pe/schedule.h"
 #include "paddle/cinn/ir/ir.h"
 #include "paddle/cinn/ir/ir_base.h"
+#include "paddle/cinn/optim/ir_copy.h"
 #include "paddle/cinn/optim/ir_simplify.h"
+#include "paddle/cinn/optim/replace_var_with_expr.h"
 #include "paddle/cinn/poly/isl_utils.h"
 #include "paddle/cinn/utils/string.h"
 
+DECLARE_bool(cinn_new_group_scheduler);
 namespace cinn {
 namespace hlir {
 namespace pe {
+
+// For using ExternalCall to call externally written reduce function,
+// special operations need to be performed on var in IR
+// to meet the conditions for subsequent analysis of IR and schedule.
+void ProcessExternalReduceVar(const ir::IRSchedule &ir_sch,
+                              const std::string &block_name) {
+  ir::Expr tmp_out_block = ir_sch.GetBlock(block_name);
+  std::vector<ir::Expr> &tmp_iter_values =
+      tmp_out_block.As<ir::ScheduleBlockRealize>()->iter_values;
+  std::vector<ir::Var> &tmp_iter_vars =
+      tmp_out_block.As<ir::ScheduleBlockRealize>()
+          ->schedule_block.As<ir::ScheduleBlock>()
+          ->iter_vars;
+  std::unordered_map<std::string, std::tuple<ir::Expr, ir::Expr>>
+      var_name_to_range;
+
+  auto CalculateLoopVarRange = [&](ir::Expr block) {
+    std::vector<ir::Expr> loops = ir_sch.GetLoops(block);
+    for (ir::Expr loop : loops) {
+      ir::Var loop_var = loop.As<ir::For>()->loop_var;
+      var_name_to_range[loop_var->name] =
+          std::make_pair(loop.As<ir::For>()->min, loop.As<ir::For>()->extent);
+    }
+    std::set<ir::Expr> vars_in_block = ir::CollectIRNodesWithoutTensor(
+        block, [](const ir::Expr *x) { return x->As<ir::_Var_>(); });
+    for (ir::Expr var : vars_in_block) {
+      if (var_name_to_range.count(var.as_var()->name) > 0) {
+        LOG(INFO) << "var: " << var;
+        var.as_var()->lower_bound =
+            std::get<0>(var_name_to_range[var.as_var()->name]);
+        var.as_var()->upper_bound =
+            std::get<1>(var_name_to_range[var.as_var()->name]);
+      }
+    }
+  };
+
+  auto ChangeVarsToLoopVar = [&](ir::Expr expr) {
+    std::set<ir::Expr> vars_in_expr = ir::CollectIRNodesWithoutTensor(
+        expr, [](const ir::Expr *x) { return x->As<ir::_Var_>(); });
+    for (const ir::Expr &var : vars_in_expr) {
+      for (int i = 0; i < tmp_iter_values.size(); ++i) {
+        if (tmp_iter_values[i].As<ir::_Var_>() &&
+            var.As<ir::_Var_>()->name ==
+                tmp_iter_vars[i].As<ir::_Var_>()->name) {
+          optim::ReplaceVarWithExpr(
+              &expr, var.as_var_ref(), tmp_iter_values[i]);
+          LOG(INFO) << "expr: " << expr;
+        }
+      }
+    }
+  };
+
+  auto CalculateExtent = [](ir::Expr expr) {
+    struct Mutator : public ir::IRMutator<ir::Expr *> {
+      void operator()(ir::Expr *expr) { Visit(expr); }
+      void Visit(ir::Expr *expr) { ir::IRMutator<>::Visit(expr, expr); }
+
+     private:
+      void Visit(const ir::_Var_ *op, ir::Expr *expr) override {
+        *expr = op->upper_bound;
+      }
+    };
+    ir::Expr expr_copy = optim::IRCopy(expr);
+    Mutator mutator;
+    mutator(&expr_copy);
+    expr_copy = common::AutoSimplify(expr_copy);
+    LOG(INFO) << "expr_copy: " << expr_copy;
+    CHECK(expr_copy.is_constant());
+    return static_cast<int>(expr_copy.get_constant());
+  };
+
+  CalculateLoopVarRange(tmp_out_block);
+  std::set<ir::Expr> store_and_load =
+      ir::CollectIRNodesWithoutTensor(tmp_out_block, [](const ir::Expr *expr) {
+        return expr->As<ir::Store>() || expr->As<ir::Load>();
+      });
+  for (ir::Expr node : store_and_load) {
+    std::vector<ir::Expr> indices;
+    if (node.As<ir::Store>()) {
+      indices = node.As<ir::Store>()->indices;
+    } else if (node.As<ir::Load>()) {
+      indices = node.As<ir::Load>()->indices;
+    }
+    for (int i = 0; i < indices.size(); i++) {
+      if (indices[i].As<ir::_Var_>()) {
+        continue;
+      }
+      ir::Var new_var(ir::Expr(0),
+                      ir::Expr(CalculateExtent(indices[i])),
+                      cinn::UniqName("reduce_i"),
+                      /* is_reduce = */ true);
+      ChangeVarsToLoopVar(indices[i]);
+      tmp_iter_values.push_back(indices[i]);
+      tmp_iter_vars.push_back(new_var);
+      if (node.As<ir::Store>()) {
+        node.As<ir::Store>()->indices[i] = ir::Expr(new_var);
+      } else if (node.As<ir::Load>()) {
+        node.As<ir::Load>()->indices[i] = ir::Expr(new_var);
+      }
+    }
+  }
+}
 
 void IRElementwiseSchedule(ir::IRSchedule &ir_sch,  // NOLINT
                            const std::vector<int> &output_shape,
@@ -396,6 +501,11 @@ void IRCudaScheduleBlockReduceInternal(ir::IRSchedule &ir_sch,  // NOLINT
                                        const common::Target &target) {
   VLOG(3) << "Before IRCudaScheduleBlockReduceInternal : "
           << ir_sch.GetModule().GetExprs().at(0);
+
+  if (FLAGS_cinn_new_group_scheduler) {
+    ProcessExternalReduceVar(ir_sch, tmp_out->name);
+  }
+
   int fuse_times = ir_sch.GetLoops(tmp_out->name).size() - 2;
   for (int idx = 0; idx < fuse_times; ++idx) {
     for (auto &tensor : {tmp_out, out}) {
@@ -452,12 +562,37 @@ void IRCudaScheduleBlockReduceInternal(ir::IRSchedule &ir_sch,  // NOLINT
     }
   }
 
+  auto SetReduceAxis = [](ir::Expr loop, ir::Expr block) {
+    std::string var_name = loop.As<ir::For>()->loop_var->name;
+    std::vector<ir::Var> iter_vars =
+        block.As<ir::ScheduleBlockRealize>()
+            ->schedule_block.As<ir::ScheduleBlock>()
+            ->iter_vars;
+    std::vector<ir::Expr> iter_values =
+        block.As<ir::ScheduleBlockRealize>()->iter_values;
+    CHECK_EQ(iter_vars.size(), iter_values.size());
+    for (int i = 0; i < iter_values.size(); ++i) {
+      std::set<Expr> contains = ir::CollectIRNodesWithoutTensor(
+          iter_values[i],
+          [&var_name](const Expr *expr) {
+            return expr->As<ir::_Var_>() &&
+                   expr->As<ir::_Var_>()->name == var_name;
+          },
+          true);
+      if (!contains.empty()) {
+        iter_vars[i]->is_reduce_axis = true;
+      }
+    }
+  };
+
   auto loops_tmp_out = ir_sch.GetLoops(tmp_out->name);
   auto loops_out = ir_sch.GetLoops(out->name);
   if (loops_tmp_out.size() == 1) {
+    // SetReduceAxis(loops_tmp_out[0], ir_sch.GetBlock(tmp_out->name));
     ir_sch.Bind(loops_tmp_out[0], "threadIdx.x");
     ir_sch.Bind(loops_out[0], "threadIdx.x");
   } else {
+    // SetReduceAxis(loops_tmp_out[1], ir_sch.GetBlock(tmp_out->name));
     ir_sch.Bind(loops_tmp_out[0], "blockIdx.x");
     ir_sch.Bind(loops_tmp_out[1], "threadIdx.x");
 
@@ -471,7 +606,11 @@ void IRCudaScheduleBlockReduceInternal(ir::IRSchedule &ir_sch,  // NOLINT
 
   for (auto &tensor : {tmp_out}) {
     auto block = ir_sch.GetBlock(tensor->name);
-    ir_sch.SetBuffer(block, "local", true);
+    if (FLAGS_cinn_new_group_scheduler) {
+      ir_sch.SetBuffer(block, "local");
+    } else {
+      ir_sch.SetBuffer(block, "local", true);
+    }
   }
 
   VLOG(3) << "After IRCudaScheduleBlockReduceInternal : "
@@ -673,8 +812,10 @@ void IRCudaScheduleBlockShuffleReduce(ir::IRSchedule &ir_sch,  // NOLINT
       auto load = exprs.front().As<ir::Load>();
       load->indices = {index};
     };
-    hand_write_simplify(ir_sch.GetLoops(reshape->name),
-                        ir_sch.GetBlock(reshape->name));
+    if (!FLAGS_cinn_new_group_scheduler) {
+      hand_write_simplify(ir_sch.GetLoops(reshape->name),
+                          ir_sch.GetBlock(reshape->name));
+    }
     auto block = ir_sch.GetBlock(reshape->name);
     ir_sch.ComputeInline(block);
     VLOG(4) << "After simplify reshape index : "
@@ -888,6 +1029,9 @@ void IRCudaTwoStepReduceSchedule(ir::IRSchedule &ir_sch,  // NOLINT
                                  const common::Target &target) {
   VLOG(3) << "Before IRCudaTwoStepReduceSchedule : "
           << ir_sch.GetModule().GetExprs().at(0);
+  if (FLAGS_cinn_new_group_scheduler) {
+    ProcessExternalReduceVar(ir_sch, tmp_out->name);
+  }
   // fuse axis
   int fuse_times =
       ir_sch.GetLoops(internal->name).size() - internal->reduce_axis.size() - 2;
@@ -955,10 +1099,14 @@ void IRCudaTwoStepReduceSchedule(ir::IRSchedule &ir_sch,  // NOLINT
   ir_sch.ComputeInline(reshape_block);
 
   auto internal_block = ir_sch.GetBlock(internal->name);
-  ir_sch.SetBuffer(internal_block, "local", true);
-
   auto tmp_out_block = ir_sch.GetBlock(tmp_out->name);
-  ir_sch.SetBuffer(tmp_out_block, "local", true);
+  if (FLAGS_cinn_new_group_scheduler) {
+    ir_sch.SetBuffer(internal_block, "local");
+    ir_sch.SetBuffer(tmp_out_block, "local");
+  } else {
+    ir_sch.SetBuffer(internal_block, "local", true);
+    ir_sch.SetBuffer(tmp_out_block, "local", true);
+  }
 
   // The current one-dimensional reduce does not make full use of SM.
   // This case is optimized into a two-dimensional.
